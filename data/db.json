@@ -1,0 +1,32 @@
+{
+  "passwords": {
+    "9a7f46eda8ea870f5944bddbf5f5d07e2b250195b266bc855c9fe69d9cce9260": {
+      "createdAt": "2026-06-05T22:57:55.452Z",
+      "usedBy": null,
+      "usedAt": null
+    },
+    "33cd2082c031264259bfc7808763c0d4b78f7d9bf8dd8d654a532bd369b5e415": {
+      "createdAt": "2026-06-05T22:57:55.453Z",
+      "usedBy": null,
+      "usedAt": null
+    },
+    "b7225d7ec5376e6b2a5a44c1173a7c0c0302a919f62a116f7c1ab1f2b6e036f7": {
+      "createdAt": "2026-06-05T22:57:55.453Z",
+      "usedBy": null,
+      "usedAt": null
+    },
+    "1985c3f0328f44fc8623a39ab72cd73fb844d0d7e3659c21155ccf6d208e6ca7": {
+      "createdAt": "2026-06-05T22:57:55.453Z",
+      "usedBy": null,
+      "usedAt": null
+    },
+    "1679f445d867d2ba184667fd423f2e6aced112a2fde14713fde12e516decd9cd": {
+      "createdAt": "2026-06-05T22:57:55.453Z",
+      "usedBy": null,
+      "usedAt": null
+    }
+  },
+  "users": {},
+  "pendingDeletes": [],
+  "lastUpdateId": 0
+}

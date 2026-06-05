@@ -317,4 +317,4 @@ setInterval(() => {
 
 await safeTelegram("deleteWebhook", { drop_pending_updates: false });
 console.log("Telegram bot polling started.");
-await pollOnce();
+await pollOnce().catch((error) => console.error(error.message));
