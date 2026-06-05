@@ -1,0 +1,19 @@
+{
+  "name": "telegram-anonymous-room",
+  "version": "1.0.0",
+  "description": "Password-gated anonymous Telegram relay bot with one-hour message deletion.",
+  "type": "module",
+  "main": "src/bot.mjs",
+  "scripts": {
+    "start": "node src/bot.mjs",
+    "generate-passwords": "node scripts/generate-passwords.mjs",
+    "validate": "node --check src/bot.mjs && node --check scripts/generate-passwords.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^5.1.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
