@@ -67,37 +67,94 @@ function makePassword() {
   return randomBytes(18).toString("base64url");
 }
 
-function generatePasswords(count) {
+function normalizeDb(rawDb) {
+  const nextDb = { ...starterDb, ...rawDb };
+  nextDb.passwords = nextDb.passwords || {};
+  nextDb.users = nextDb.users || {};
+  nextDb.ownerIds = nextDb.ownerIds || [];
+  nextDb.ownerKeyHashes = nextDb.ownerKeyHashes || [];
+  nextDb.pendingDeletes = nextDb.pendingDeletes || [];
+
+  for (const [hash, entry] of Object.entries(nextDb.passwords)) {
+    nextDb.passwords[hash] = {
+      createdAt: entry.createdAt || new Date().toISOString(),
+      label: entry.label || "",
+      revoked: Boolean(entry.revoked),
+      assignedTo: entry.assignedTo || entry.usedBy || null,
+      assignedAt: entry.assignedAt || entry.usedAt || null,
+      lastUsedBy: entry.lastUsedBy || entry.usedBy || null,
+      lastUsedAt: entry.lastUsedAt || entry.usedAt || null,
+      useCount: Number(entry.useCount || (entry.usedAt ? 1 : 0)),
+    };
+  }
+
+  for (const [userId, user] of Object.entries(nextDb.users)) {
+    const credentialHash =
+      user.credentialHash ||
+      Object.entries(nextDb.passwords).find(([, entry]) => entry.assignedTo === userId)?.[0] ||
+      null;
+    nextDb.users[userId] = {
+      ...user,
+      id: String(user.id || userId),
+      credentialHash,
+      active: Boolean(user.active),
+    };
+  }
+
+  return nextDb;
+}
+
+function createCredential(password, label = "") {
+  const cleanPassword = String(password || "").trim();
+  if (cleanPassword.length < 4) {
+    throw new Error("Password must be at least 4 characters.");
+  }
+
+  const hash = passwordHash(cleanPassword);
+  db.passwords[hash] = {
+    createdAt: db.passwords[hash]?.createdAt || new Date().toISOString(),
+    label: String(label || "").trim(),
+    revoked: false,
+    assignedTo: db.passwords[hash]?.assignedTo || null,
+    assignedAt: db.passwords[hash]?.assignedAt || null,
+    lastUsedBy: db.passwords[hash]?.lastUsedBy || null,
+    lastUsedAt: db.passwords[hash]?.lastUsedAt || null,
+    useCount: Number(db.passwords[hash]?.useCount || 0),
+  };
+  return { password: cleanPassword, hash };
+}
+
+function generatePasswords(count, labelPrefix = "Member") {
   const safeCount = Math.max(1, Math.min(Number(count) || roomSize, 25));
   const created = [];
 
   for (let index = 0; index < safeCount; index += 1) {
     const password = makePassword();
-    db.passwords[passwordHash(password)] = {
-      createdAt: new Date().toISOString(),
-      usedBy: null,
-      usedAt: null,
-    };
+    createCredential(password, `${labelPrefix} ${index + 1}`);
     created.push(password);
   }
 
   return created;
 }
 
-function unusedPasswordCount() {
-  return Object.values(db.passwords || {}).filter((entry) => !entry.usedBy).length;
+function activeCredentialCount() {
+  return Object.values(db.passwords || {}).filter((entry) => !entry.revoked).length;
 }
 
-function resetRoom(count = roomSize) {
+function openCredentialCount() {
+  return Object.values(db.passwords || {}).filter((entry) => !entry.revoked && !entry.assignedTo).length;
+}
+
+function resetRoom(count = roomSize, labelPrefix = "Member") {
   db.passwords = {};
   db.users = {};
-  return generatePasswords(count);
+  return generatePasswords(count, labelPrefix);
 }
 
 async function loadDb() {
   await mkdir(dataDir, { recursive: true });
   try {
-    return { ...starterDb, ...JSON.parse(await readFile(dbPath, "utf8")) };
+    return normalizeDb(JSON.parse(await readFile(dbPath, "utf8")));
   } catch {
     await saveDb(starterDb);
     return structuredClone(starterDb);
@@ -201,8 +258,13 @@ async function registerPassword(message, password) {
     return;
   }
 
-  if (entry.usedBy && entry.usedBy !== userId) {
-    await sendExpiringMessage(message.chat.id, "That password has already been used.");
+  if (entry.revoked) {
+    await sendExpiringMessage(message.chat.id, "That password has been revoked by the room owner.");
+    return;
+  }
+
+  if (entry.assignedTo && entry.assignedTo !== userId) {
+    await sendExpiringMessage(message.chat.id, "That password is assigned to another Telegram account. Ask the owner to reset or create a new password.");
     return;
   }
 
@@ -212,17 +274,21 @@ async function registerPassword(message, password) {
     return;
   }
 
-  const alias = existing?.alias || nextAlias();
+  const alias = existing?.alias || entry.label || nextAlias();
   db.passwords[hash] = {
     ...entry,
-    usedBy: userId,
-    usedAt: new Date().toISOString(),
+    assignedTo: entry.assignedTo || userId,
+    assignedAt: entry.assignedAt || new Date().toISOString(),
+    lastUsedBy: userId,
+    lastUsedAt: new Date().toISOString(),
+    useCount: Number(entry.useCount || 0) + 1,
   };
   db.users[userId] = {
     id: userId,
     chatId: message.chat.id,
     alias,
     active: true,
+    credentialHash: hash,
     joinedAt: existing?.joinedAt || new Date().toISOString(),
   };
   await saveDb();
@@ -306,7 +372,19 @@ async function handleMessage(message) {
     await saveDb();
     await sendExpiringMessage(
       message.chat.id,
-      "Owner mode enabled.\n\nCommands:\n/newroom - create a fresh room and 5 codes\n/newcodes 3 - add more member codes\n/room - show room status",
+      [
+        "Owner mode enabled.",
+        "",
+        "Commands:",
+        "/newroom - create a fresh room and 5 reusable passwords",
+        "/newcodes 3 - add random reusable passwords",
+        "/setpass Name password - create a custom password",
+        "/revoke password - revoke a password",
+        "/resetpass password - clear a password assignment",
+        "/rename OldAlias NewAlias - rename a person",
+        "/members - list members",
+        "/room - show room status",
+      ].join("\n"),
     );
     return;
   }
@@ -328,7 +406,84 @@ async function handleMessage(message) {
     await saveDb();
     await sendExpiringMessage(
       message.chat.id,
-      `New member code${passwords.length === 1 ? "" : "s"}:\n\n${passwords.map((password, index) => `${index + 1}. ${password}`).join("\n")}`,
+      `New reusable password${passwords.length === 1 ? "" : "s"}:\n\n${passwords.map((password, index) => `${index + 1}. ${password}`).join("\n")}`,
+    );
+    return;
+  }
+
+  if (isOwnerUser(userId) && text?.startsWith("/setpass")) {
+    const parts = text.split(/\s+/);
+    const label = parts[1];
+    const customPassword = parts.slice(2).join(" ");
+    if (!label || !customPassword) {
+      await sendExpiringMessage(message.chat.id, "Use: /setpass Name password");
+      return;
+    }
+    try {
+      createCredential(customPassword, label);
+      await saveDb();
+      await sendExpiringMessage(message.chat.id, `Reusable password created for ${label}:\n${customPassword}`);
+    } catch (error) {
+      await sendExpiringMessage(message.chat.id, error.message);
+    }
+    return;
+  }
+
+  if (isOwnerUser(userId) && text?.startsWith("/revoke")) {
+    const password = text.replace(/^\/revoke(?:@\w+)?\s*/i, "");
+    const hash = passwordHash(password);
+    const entry = db.passwords[hash];
+    if (!password || !entry) {
+      await sendExpiringMessage(message.chat.id, "Password not found.");
+      return;
+    }
+    entry.revoked = true;
+    if (entry.assignedTo && db.users[entry.assignedTo]) {
+      db.users[entry.assignedTo].active = false;
+    }
+    await saveDb();
+    await sendExpiringMessage(message.chat.id, "Password revoked.");
+    return;
+  }
+
+  if (isOwnerUser(userId) && text?.startsWith("/resetpass")) {
+    const password = text.replace(/^\/resetpass(?:@\w+)?\s*/i, "");
+    const hash = passwordHash(password);
+    const entry = db.passwords[hash];
+    if (!password || !entry) {
+      await sendExpiringMessage(message.chat.id, "Password not found.");
+      return;
+    }
+    entry.assignedTo = null;
+    entry.assignedAt = null;
+    entry.lastUsedBy = null;
+    entry.lastUsedAt = null;
+    await saveDb();
+    await sendExpiringMessage(message.chat.id, "Password assignment cleared. It can be used by a Telegram account again.");
+    return;
+  }
+
+  if (isOwnerUser(userId) && text?.startsWith("/rename")) {
+    const [, oldAlias, ...newAliasParts] = text.split(/\s+/);
+    const newAlias = newAliasParts.join(" ").trim();
+    const target = Object.values(db.users).find((person) => person.alias?.toLowerCase() === oldAlias?.toLowerCase());
+    if (!oldAlias || !newAlias || !target) {
+      await sendExpiringMessage(message.chat.id, "Use: /rename OldAlias NewAlias");
+      return;
+    }
+    target.alias = newAlias.slice(0, 40);
+    await saveDb();
+    await sendExpiringMessage(message.chat.id, `Renamed ${oldAlias} to ${target.alias}.`);
+    return;
+  }
+
+  if (isOwnerUser(userId) && text === "/members") {
+    const users = Object.values(db.users);
+    await sendExpiringMessage(
+      message.chat.id,
+      users.length
+        ? users.map((person) => `${person.alias}: ${person.active ? "active" : "inactive"}`).join("\n")
+        : "No members yet.",
     );
     return;
   }
@@ -336,7 +491,7 @@ async function handleMessage(message) {
   if (isOwnerUser(userId) && text === "/room") {
     await sendExpiringMessage(
       message.chat.id,
-      `${activeUsers().length}/${roomSize} connected.\nUnused codes: ${unusedPasswordCount()}`,
+      `${activeUsers().length}/${roomSize} connected.\nActive passwords: ${activeCredentialCount()}\nOpen passwords: ${openCredentialCount()}`,
     );
     return;
   }
@@ -344,7 +499,7 @@ async function handleMessage(message) {
   if (text === "/start") {
     await sendExpiringMessage(
       message.chat.id,
-      "Send your unique room password. I will delete the password message immediately after checking it.",
+      "Send your room password. I will delete the password message immediately after checking it.",
     );
     return;
   }
@@ -410,8 +565,12 @@ function escapeHtml(value) {
 
 function dashboardPage(ownerKey, generated = []) {
   const users = activeUsers();
+  const allUsers = Object.values(db.users || {});
+  const credentials = Object.entries(db.passwords || {}).sort(([, left], [, right]) =>
+    String(left.label || "").localeCompare(String(right.label || "")),
+  );
   const codeList = generated.length
-    ? `<section class="result"><h2>New codes</h2><p>Copy these now. They are shown once.</p><pre>${escapeHtml(generated.map((password, index) => `${index + 1}. ${password}`).join("\n"))}</pre></section>`
+    ? `<section class="result"><h2>New passwords</h2><p>Copy these now. They are shown once.</p><pre>${escapeHtml(generated.map((password, index) => `${index + 1}. ${password}`).join("\n"))}</pre></section>`
     : "";
 
   return `<!doctype html>
@@ -434,8 +593,15 @@ function dashboardPage(ownerKey, generated = []) {
     input { border: 1px solid #cbd3ca; border-radius: 8px; padding: 10px; font: inherit; }
     button { border: 0; border-radius: 8px; padding: 11px 14px; background: #137b63; color: white; font-weight: 800; cursor: pointer; }
     button.danger { background: #a53838; }
+    button.light { background: #5d6d68; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #17211f; color: #f9fff8; padding: 14px; border-radius: 8px; }
     ul { padding-left: 20px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border-top: 1px solid #d8ded6; padding: 10px 8px; text-align: left; vertical-align: top; }
+    th { color: #5d6d68; font-size: 0.85rem; }
+    .stack { display: grid; gap: 8px; }
+    .mini { font-size: 0.85rem; color: #5d6d68; }
+    .inline { display: inline-flex; margin: 0 6px 6px 0; }
     @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } body { padding: 12px; } }
   </style>
 </head>
@@ -447,32 +613,110 @@ function dashboardPage(ownerKey, generated = []) {
     </header>
     <section class="grid">
       <div class="stat"><span>Connected</span><strong>${users.length}/${roomSize}</strong></div>
-      <div class="stat"><span>Unused codes</span><strong>${unusedPasswordCount()}</strong></div>
+      <div class="stat"><span>Active passwords</span><strong>${activeCredentialCount()}</strong></div>
+      <div class="stat"><span>Open passwords</span><strong>${openCredentialCount()}</strong></div>
       <div class="stat"><span>Owners</span><strong>${(db.ownerIds || []).length}</strong></div>
     </section>
     ${codeList}
     <section>
       <h2>Create Fresh Room</h2>
-      <p>This clears joined members and old codes, then creates new codes.</p>
+      <p>This clears joined members and old passwords, then creates new reusable passwords.</p>
       <form method="post" action="/owner/new-room">
         <input type="hidden" name="ownerKey" value="${escapeHtml(ownerKey)}" />
-        <label>Codes <input name="count" type="number" min="1" max="25" value="${roomSize}" /></label>
+        <label>Passwords <input name="count" type="number" min="1" max="25" value="${roomSize}" /></label>
+        <label>Label prefix <input name="labelPrefix" value="Member" /></label>
         <button class="danger" type="submit">Create fresh room</button>
       </form>
     </section>
     <section>
-      <h2>Add New Member Codes</h2>
-      <form method="post" action="/owner/new-codes">
+      <h2>Add Random Passwords</h2>
+      <form method="post" action="/owner/new-passwords">
         <input type="hidden" name="ownerKey" value="${escapeHtml(ownerKey)}" />
-        <label>Codes <input name="count" type="number" min="1" max="25" value="1" /></label>
-        <button type="submit">Create codes</button>
+        <label>Passwords <input name="count" type="number" min="1" max="25" value="1" /></label>
+        <label>Label prefix <input name="labelPrefix" value="Member" /></label>
+        <button type="submit">Create random passwords</button>
       </form>
+    </section>
+    <section>
+      <h2>Assign Custom Password</h2>
+      <form method="post" action="/owner/custom-password">
+        <input type="hidden" name="ownerKey" value="${escapeHtml(ownerKey)}" />
+        <label>Name <input name="label" placeholder="Ayush" required /></label>
+        <label>Password <input name="password" placeholder="custom-password" required /></label>
+        <button type="submit">Save custom password</button>
+      </form>
+    </section>
+    <section>
+      <h2>Passwords</h2>
+      ${
+        credentials.length
+          ? `<table>
+              <thead><tr><th>Name</th><th>Status</th><th>Assigned to</th><th>Uses</th><th>Actions</th></tr></thead>
+              <tbody>
+                ${credentials
+                  .map(([hash, entry]) => {
+                    const assigned = entry.assignedTo ? db.users[entry.assignedTo] : null;
+                    const status = entry.revoked ? "Revoked" : entry.assignedTo ? "Assigned" : "Open";
+                    return `<tr>
+                      <td><strong>${escapeHtml(entry.label || "Unnamed")}</strong><div class="mini">${escapeHtml(hash.slice(0, 10))}</div></td>
+                      <td>${escapeHtml(status)}</td>
+                      <td>${assigned ? escapeHtml(assigned.alias || assigned.id) : "Not assigned yet"}</td>
+                      <td>${Number(entry.useCount || 0)}</td>
+                      <td>
+                        <form class="inline" method="post" action="/owner/revoke-password">
+                          <input type="hidden" name="ownerKey" value="${escapeHtml(ownerKey)}" />
+                          <input type="hidden" name="hash" value="${escapeHtml(hash)}" />
+                          <button class="danger" type="submit">Revoke</button>
+                        </form>
+                        <form class="inline" method="post" action="/owner/restore-password">
+                          <input type="hidden" name="ownerKey" value="${escapeHtml(ownerKey)}" />
+                          <input type="hidden" name="hash" value="${escapeHtml(hash)}" />
+                          <button type="submit">Restore</button>
+                        </form>
+                        <form class="inline" method="post" action="/owner/reset-password">
+                          <input type="hidden" name="ownerKey" value="${escapeHtml(ownerKey)}" />
+                          <input type="hidden" name="hash" value="${escapeHtml(hash)}" />
+                          <button class="light" type="submit">Reset assignment</button>
+                        </form>
+                      </td>
+                    </tr>`;
+                  })
+                  .join("")}
+              </tbody>
+            </table>`
+          : "<p>No passwords yet.</p>"
+      }
     </section>
     <section>
       <h2>People</h2>
       ${
-        users.length
-          ? `<ul>${users.map((person) => `<li>${escapeHtml(person.alias)} joined ${escapeHtml(person.joinedAt)}</li>`).join("")}</ul>`
+        allUsers.length
+          ? `<table>
+              <thead><tr><th>Name</th><th>Status</th><th>Rename</th><th>Remove</th></tr></thead>
+              <tbody>
+                ${allUsers
+                  .map((person) => `<tr>
+                    <td><strong>${escapeHtml(person.alias)}</strong><div class="mini">${escapeHtml(person.joinedAt || "")}</div></td>
+                    <td>${person.active ? "Active" : "Inactive"}</td>
+                    <td>
+                      <form method="post" action="/owner/rename-user">
+                        <input type="hidden" name="ownerKey" value="${escapeHtml(ownerKey)}" />
+                        <input type="hidden" name="userId" value="${escapeHtml(person.id)}" />
+                        <label>New name <input name="alias" value="${escapeHtml(person.alias)}" /></label>
+                        <button type="submit">Rename</button>
+                      </form>
+                    </td>
+                    <td>
+                      <form method="post" action="/owner/remove-user">
+                        <input type="hidden" name="ownerKey" value="${escapeHtml(ownerKey)}" />
+                        <input type="hidden" name="userId" value="${escapeHtml(person.id)}" />
+                        <button class="danger" type="submit">Remove</button>
+                      </form>
+                    </td>
+                  </tr>`)
+                  .join("")}
+              </tbody>
+            </table>`
           : "<p>No one is connected yet.</p>"
       }
     </section>
@@ -521,7 +765,15 @@ app.get("/owner", (request, response) => {
 app.post("/owner/new-room", async (request, response) => {
   const ownerKey = requireOwnerKey(request, response);
   if (!ownerKey) return;
-  const generated = resetRoom(request.body?.count);
+  const generated = resetRoom(request.body?.count, request.body?.labelPrefix || "Member");
+  await saveDb();
+  response.type("html").send(dashboardPage(ownerKey, generated));
+});
+
+app.post("/owner/new-passwords", async (request, response) => {
+  const ownerKey = requireOwnerKey(request, response);
+  if (!ownerKey) return;
+  const generated = generatePasswords(request.body?.count, request.body?.labelPrefix || "Member");
   await saveDb();
   response.type("html").send(dashboardPage(ownerKey, generated));
 });
@@ -529,9 +781,93 @@ app.post("/owner/new-room", async (request, response) => {
 app.post("/owner/new-codes", async (request, response) => {
   const ownerKey = requireOwnerKey(request, response);
   if (!ownerKey) return;
-  const generated = generatePasswords(request.body?.count);
+  const generated = generatePasswords(request.body?.count, request.body?.labelPrefix || "Member");
   await saveDb();
   response.type("html").send(dashboardPage(ownerKey, generated));
+});
+
+app.post("/owner/custom-password", async (request, response) => {
+  const ownerKey = requireOwnerKey(request, response);
+  if (!ownerKey) return;
+  let generated = [];
+  try {
+    const password = String(request.body?.password || "").trim();
+    createCredential(password, request.body?.label || "");
+    generated = [password];
+    await saveDb();
+  } catch {
+    generated = [];
+  }
+  response.type("html").send(dashboardPage(ownerKey, generated));
+});
+
+app.post("/owner/revoke-password", async (request, response) => {
+  const ownerKey = requireOwnerKey(request, response);
+  if (!ownerKey) return;
+  const entry = db.passwords[String(request.body?.hash || "")];
+  if (entry) {
+    entry.revoked = true;
+    if (entry.assignedTo && db.users[entry.assignedTo]) {
+      db.users[entry.assignedTo].active = false;
+    }
+    await saveDb();
+  }
+  response.type("html").send(dashboardPage(ownerKey));
+});
+
+app.post("/owner/restore-password", async (request, response) => {
+  const ownerKey = requireOwnerKey(request, response);
+  if (!ownerKey) return;
+  const entry = db.passwords[String(request.body?.hash || "")];
+  if (entry) {
+    entry.revoked = false;
+    await saveDb();
+  }
+  response.type("html").send(dashboardPage(ownerKey));
+});
+
+app.post("/owner/reset-password", async (request, response) => {
+  const ownerKey = requireOwnerKey(request, response);
+  if (!ownerKey) return;
+  const entry = db.passwords[String(request.body?.hash || "")];
+  if (entry) {
+    if (entry.assignedTo && db.users[entry.assignedTo]) {
+      db.users[entry.assignedTo].active = false;
+    }
+    entry.assignedTo = null;
+    entry.assignedAt = null;
+    entry.lastUsedBy = null;
+    entry.lastUsedAt = null;
+    await saveDb();
+  }
+  response.type("html").send(dashboardPage(ownerKey));
+});
+
+app.post("/owner/rename-user", async (request, response) => {
+  const ownerKey = requireOwnerKey(request, response);
+  if (!ownerKey) return;
+  const user = db.users[String(request.body?.userId || "")];
+  const alias = String(request.body?.alias || "").trim().slice(0, 40);
+  if (user && alias) {
+    user.alias = alias;
+    await saveDb();
+  }
+  response.type("html").send(dashboardPage(ownerKey));
+});
+
+app.post("/owner/remove-user", async (request, response) => {
+  const ownerKey = requireOwnerKey(request, response);
+  if (!ownerKey) return;
+  const user = db.users[String(request.body?.userId || "")];
+  if (user) {
+    user.active = false;
+    if (user.credentialHash && db.passwords[user.credentialHash]?.assignedTo === user.id) {
+      db.passwords[user.credentialHash].assignedTo = null;
+      db.passwords[user.credentialHash].assignedAt = null;
+    }
+    await saveDb();
+  }
+  response.type("html").send(dashboardPage(ownerKey));
 });
 
 app.get("/health", (_request, response) => {
