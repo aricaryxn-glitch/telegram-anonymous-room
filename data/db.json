@@ -27,6 +27,10 @@
     }
   },
   "users": {},
+  "ownerIds": [],
+  "ownerKeyHashes": [
+    "d33818d953968d00f42854a9b4de6dd13672d0b939edef7c366c108fbd55d34c"
+  ],
   "pendingDeletes": [],
   "lastUpdateId": 0
 }

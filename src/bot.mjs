@@ -1,6 +1,6 @@
 import "dotenv/config";
 import express from "express";
-import { createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,6 +29,8 @@ if (!pepper || pepper.length < 24) {
 const starterDb = {
   passwords: {},
   users: {},
+  ownerIds: [],
+  ownerKeyHashes: [],
   pendingDeletes: [],
   lastUpdateId: 0,
 };
@@ -38,6 +40,58 @@ let polling = false;
 
 function passwordHash(password) {
   return createHmac("sha256", pepper).update(String(password).trim()).digest("hex");
+}
+
+function ownerKeyHash(ownerKey) {
+  return createHash("sha256").update(String(ownerKey).trim()).digest("hex");
+}
+
+function ownerKeyHashes() {
+  const fromEnv = String(process.env.OWNER_KEY_HASHES || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  return new Set([...fromEnv, ...(db.ownerKeyHashes || [])]);
+}
+
+function isOwnerKey(ownerKey) {
+  const key = String(ownerKey || "").trim();
+  return key.length >= 20 && ownerKeyHashes().has(ownerKeyHash(key));
+}
+
+function isOwnerUser(userId) {
+  return (db.ownerIds || []).includes(String(userId));
+}
+
+function makePassword() {
+  return randomBytes(18).toString("base64url");
+}
+
+function generatePasswords(count) {
+  const safeCount = Math.max(1, Math.min(Number(count) || roomSize, 25));
+  const created = [];
+
+  for (let index = 0; index < safeCount; index += 1) {
+    const password = makePassword();
+    db.passwords[passwordHash(password)] = {
+      createdAt: new Date().toISOString(),
+      usedBy: null,
+      usedAt: null,
+    };
+    created.push(password);
+  }
+
+  return created;
+}
+
+function unusedPasswordCount() {
+  return Object.values(db.passwords || {}).filter((entry) => !entry.usedBy).length;
+}
+
+function resetRoom(count = roomSize) {
+  db.passwords = {};
+  db.users = {};
+  return generatePasswords(count);
 }
 
 async function loadDb() {
@@ -234,6 +288,58 @@ async function handleMessage(message) {
 
   const text = message.text?.trim();
   const user = userForMessage(message);
+  const userId = String(message.from?.id || "");
+
+  if (text?.startsWith("/owner")) {
+    const ownerKey = text.replace(/^\/owner(?:@\w+)?\s*/i, "");
+    await safeTelegram("deleteMessage", {
+      chat_id: message.chat.id,
+      message_id: message.message_id,
+    });
+
+    if (!isOwnerKey(ownerKey)) {
+      await sendExpiringMessage(message.chat.id, "Owner key is not valid.");
+      return;
+    }
+
+    db.ownerIds = [...new Set([...(db.ownerIds || []), userId])];
+    await saveDb();
+    await sendExpiringMessage(
+      message.chat.id,
+      "Owner mode enabled.\n\nCommands:\n/newroom - create a fresh room and 5 codes\n/newcodes 3 - add more member codes\n/room - show room status",
+    );
+    return;
+  }
+
+  if (isOwnerUser(userId) && text?.startsWith("/newroom")) {
+    const count = Number(text.split(/\s+/)[1] || roomSize);
+    const passwords = resetRoom(count);
+    await saveDb();
+    await sendExpiringMessage(
+      message.chat.id,
+      `Fresh room created. Give each person one code:\n\n${passwords.map((password, index) => `${index + 1}. ${password}`).join("\n")}`,
+    );
+    return;
+  }
+
+  if (isOwnerUser(userId) && text?.startsWith("/newcodes")) {
+    const count = Number(text.split(/\s+/)[1] || 1);
+    const passwords = generatePasswords(count);
+    await saveDb();
+    await sendExpiringMessage(
+      message.chat.id,
+      `New member code${passwords.length === 1 ? "" : "s"}:\n\n${passwords.map((password, index) => `${index + 1}. ${password}`).join("\n")}`,
+    );
+    return;
+  }
+
+  if (isOwnerUser(userId) && text === "/room") {
+    await sendExpiringMessage(
+      message.chat.id,
+      `${activeUsers().length}/${roomSize} connected.\nUnused codes: ${unusedPasswordCount()}`,
+    );
+    return;
+  }
 
   if (text === "/start") {
     await sendExpiringMessage(
@@ -291,9 +397,143 @@ async function pollOnce() {
 }
 
 const app = express();
+app.use(express.urlencoded({ extended: false }));
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function dashboardPage(ownerKey, generated = []) {
+  const users = activeUsers();
+  const codeList = generated.length
+    ? `<section class="result"><h2>New codes</h2><p>Copy these now. They are shown once.</p><pre>${escapeHtml(generated.map((password, index) => `${index + 1}. ${password}`).join("\n"))}</pre></section>`
+    : "";
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Room Owner</title>
+  <style>
+    :root { font-family: Inter, system-ui, sans-serif; color: #17211f; background: #eef1eb; }
+    body { margin: 0; padding: 24px; }
+    main { width: min(920px, 100%); margin: 0 auto; }
+    header, section { background: #fffdf8; border: 1px solid #d8ded6; border-radius: 8px; padding: 18px; margin-bottom: 14px; }
+    h1, h2 { margin: 0 0 10px; letter-spacing: 0; }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+    .stat { background: #f5f7f1; border-radius: 8px; padding: 12px; }
+    .stat strong { display: block; font-size: 1.8rem; }
+    form { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; }
+    label { display: grid; gap: 5px; font-weight: 700; }
+    input { border: 1px solid #cbd3ca; border-radius: 8px; padding: 10px; font: inherit; }
+    button { border: 0; border-radius: 8px; padding: 11px 14px; background: #137b63; color: white; font-weight: 800; cursor: pointer; }
+    button.danger { background: #a53838; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #17211f; color: #f9fff8; padding: 14px; border-radius: 8px; }
+    ul { padding-left: 20px; }
+    @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } body { padding: 12px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Anonymous Room Owner</h1>
+      <p>Use this page to create a fresh room or add member codes.</p>
+    </header>
+    <section class="grid">
+      <div class="stat"><span>Connected</span><strong>${users.length}/${roomSize}</strong></div>
+      <div class="stat"><span>Unused codes</span><strong>${unusedPasswordCount()}</strong></div>
+      <div class="stat"><span>Owners</span><strong>${(db.ownerIds || []).length}</strong></div>
+    </section>
+    ${codeList}
+    <section>
+      <h2>Create Fresh Room</h2>
+      <p>This clears joined members and old codes, then creates new codes.</p>
+      <form method="post" action="/owner/new-room">
+        <input type="hidden" name="ownerKey" value="${escapeHtml(ownerKey)}" />
+        <label>Codes <input name="count" type="number" min="1" max="25" value="${roomSize}" /></label>
+        <button class="danger" type="submit">Create fresh room</button>
+      </form>
+    </section>
+    <section>
+      <h2>Add New Member Codes</h2>
+      <form method="post" action="/owner/new-codes">
+        <input type="hidden" name="ownerKey" value="${escapeHtml(ownerKey)}" />
+        <label>Codes <input name="count" type="number" min="1" max="25" value="1" /></label>
+        <button type="submit">Create codes</button>
+      </form>
+    </section>
+    <section>
+      <h2>People</h2>
+      ${
+        users.length
+          ? `<ul>${users.map((person) => `<li>${escapeHtml(person.alias)} joined ${escapeHtml(person.joinedAt)}</li>`).join("")}</ul>`
+          : "<p>No one is connected yet.</p>"
+      }
+    </section>
+  </main>
+</body>
+</html>`;
+}
+
+function ownerLoginPage() {
+  return `<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Owner Login</title></head>
+<body style="font-family: system-ui, sans-serif; padding: 24px; background: #eef1eb;">
+  <main style="max-width: 520px; margin: 0 auto; background: #fffdf8; border: 1px solid #d8ded6; border-radius: 8px; padding: 18px;">
+    <h1>Owner Login</h1>
+    <form method="get" action="/owner">
+      <label style="display: grid; gap: 6px;">Owner key
+        <input name="key" type="password" autofocus style="padding: 10px; border: 1px solid #cbd3ca; border-radius: 8px;" />
+      </label>
+      <button style="margin-top: 12px; padding: 10px 14px; border: 0; border-radius: 8px; background: #137b63; color: white; font-weight: 800;">Open dashboard</button>
+    </form>
+  </main>
+</body>
+</html>`;
+}
+
+function requireOwnerKey(request, response) {
+  const ownerKey = request.body?.ownerKey || request.query?.key;
+  if (!isOwnerKey(ownerKey)) {
+    response.status(401).type("html").send(ownerLoginPage());
+    return "";
+  }
+  return ownerKey;
+}
+
 app.get("/", (_request, response) => {
   response.type("text").send("Telegram Anonymous Room bot is running.");
 });
+
+app.get("/owner", (request, response) => {
+  const ownerKey = requireOwnerKey(request, response);
+  if (!ownerKey) return;
+  response.type("html").send(dashboardPage(ownerKey));
+});
+
+app.post("/owner/new-room", async (request, response) => {
+  const ownerKey = requireOwnerKey(request, response);
+  if (!ownerKey) return;
+  const generated = resetRoom(request.body?.count);
+  await saveDb();
+  response.type("html").send(dashboardPage(ownerKey, generated));
+});
+
+app.post("/owner/new-codes", async (request, response) => {
+  const ownerKey = requireOwnerKey(request, response);
+  if (!ownerKey) return;
+  const generated = generatePasswords(request.body?.count);
+  await saveDb();
+  response.type("html").send(dashboardPage(ownerKey, generated));
+});
+
 app.get("/health", (_request, response) => {
   response.json({
     ok: true,
