@@ -144,7 +144,8 @@ async function loadRemoteDb() {
   try {
     const body = await githubStateRequest(url);
     stateSha = body.sha;
-    return normalizeDb(JSON.parse(Buffer.from(body.content || "", "base64").toString("utf8")));
+    const text = Buffer.from(body.content || "", "base64").toString("utf8").replace(/^\uFEFF/, "").trim();
+    return normalizeDb(JSON.parse(text));
   } catch (error) {
     if (error.status === 404) return null;
     throw error;
