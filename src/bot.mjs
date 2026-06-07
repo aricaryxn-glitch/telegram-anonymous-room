@@ -17,6 +17,10 @@ const ttlMs = Number(process.env.MESSAGE_TTL_MS || 60 * 60 * 1000);
 const port = Number(process.env.PORT || 3000);
 const api = token ? `https://api.telegram.org/bot${token}` : "";
 const aliases = ["Moss", "Echo", "Nova", "Slate", "Rune", "Vale", "Orion", "Kite"];
+const stateGithubToken = process.env.STATE_GITHUB_TOKEN;
+const stateGithubRepo = process.env.STATE_GITHUB_REPO;
+const stateGithubPath = process.env.STATE_GITHUB_PATH || "db.json";
+const stateGithubBranch = process.env.STATE_GITHUB_BRANCH || "main";
 
 if (!token || token.includes("put_your_botfather_token_here")) {
   throw new Error("Set TELEGRAM_BOT_TOKEN in .env or hosting environment variables.");
@@ -35,6 +39,8 @@ const starterDb = {
   lastUpdateId: 0,
 };
 
+let stateSha = null;
+let saveChain = Promise.resolve();
 let db = await loadDb();
 let polling = false;
 
@@ -104,6 +110,76 @@ function normalizeDb(rawDb) {
   return nextDb;
 }
 
+function hasRemoteState() {
+  return Boolean(stateGithubToken && stateGithubRepo);
+}
+
+async function githubStateRequest(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${stateGithubToken}`,
+      "content-type": "application/json",
+      "user-agent": "telegram-anonymous-room",
+      ...(options.headers || {}),
+    },
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(body.message || response.statusText);
+    error.status = response.status;
+    throw error;
+  }
+  return body;
+}
+
+async function loadRemoteDb() {
+  if (!hasRemoteState()) return null;
+  const encodedPath = stateGithubPath
+    .split("/")
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+  const url = `https://api.github.com/repos/${stateGithubRepo}/contents/${encodedPath}?ref=${encodeURIComponent(stateGithubBranch)}`;
+  try {
+    const body = await githubStateRequest(url);
+    stateSha = body.sha;
+    return normalizeDb(JSON.parse(Buffer.from(body.content || "", "base64").toString("utf8")));
+  } catch (error) {
+    if (error.status === 404) return null;
+    throw error;
+  }
+}
+
+async function saveRemoteDb(nextDb) {
+  if (!hasRemoteState()) return;
+  const encodedPath = stateGithubPath
+    .split("/")
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+  const url = `https://api.github.com/repos/${stateGithubRepo}/contents/${encodedPath}`;
+  const payload = {
+    branch: stateGithubBranch,
+    message: "Update room state",
+    content: Buffer.from(`${JSON.stringify(nextDb, null, 2)}\n`).toString("base64"),
+  };
+  if (stateSha) payload.sha = stateSha;
+  try {
+    const body = await githubStateRequest(url, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+    stateSha = body.content?.sha || stateSha;
+  } catch (error) {
+    if (error.status !== 409) throw error;
+    const fresh = await loadRemoteDb();
+    if (fresh) {
+      db = normalizeDb({ ...fresh, ...nextDb });
+      await saveRemoteDb(db);
+    }
+  }
+}
+
 function createCredential(password, label = "") {
   const cleanPassword = String(password || "").trim();
   if (cleanPassword.length < 4) {
@@ -153,19 +229,29 @@ function resetRoom(count = roomSize, labelPrefix = "Member") {
 
 async function loadDb() {
   await mkdir(dataDir, { recursive: true });
+  const remoteDb = await loadRemoteDb();
+  if (remoteDb) return remoteDb;
+
   try {
     return normalizeDb(JSON.parse(await readFile(dbPath, "utf8")));
   } catch {
-    await saveDb(starterDb);
-    return structuredClone(starterDb);
+    const nextDb = normalizeDb(starterDb);
+    await saveDb(nextDb);
+    return nextDb;
   }
 }
 
 async function saveDb(nextDb = db) {
-  await mkdir(dataDir, { recursive: true });
-  const tmpPath = `${dbPath}.${randomUUID()}.tmp`;
-  await writeFile(tmpPath, `${JSON.stringify(nextDb, null, 2)}\n`);
-  await rename(tmpPath, dbPath);
+  const normalized = normalizeDb(nextDb);
+  db = normalized;
+  saveChain = saveChain.then(async () => {
+    await mkdir(dataDir, { recursive: true });
+    const tmpPath = `${dbPath}.${randomUUID()}.tmp`;
+    await writeFile(tmpPath, `${JSON.stringify(normalized, null, 2)}\n`);
+    await rename(tmpPath, dbPath);
+    await saveRemoteDb(normalized);
+  });
+  return saveChain;
 }
 
 async function telegram(method, payload = {}) {
@@ -191,7 +277,10 @@ async function safeTelegram(method, payload = {}) {
 }
 
 function activeUsers() {
-  return Object.values(db.users).filter((user) => user.active);
+  return Object.values(db.users).filter((user) => {
+    const credential = user.credentialHash ? db.passwords[user.credentialHash] : null;
+    return user.active && (!credential || !credential.revoked);
+  });
 }
 
 function userForMessage(message) {
@@ -875,7 +964,10 @@ app.get("/health", (_request, response) => {
     ok: true,
     connected: activeUsers().length,
     capacity: roomSize,
+    activePasswords: activeCredentialCount(),
+    openPasswords: openCredentialCount(),
     pendingDeletes: db.pendingDeletes.length,
+    state: hasRemoteState() ? "github" : "local",
   });
 });
 

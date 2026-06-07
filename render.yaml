@@ -15,3 +15,9 @@ services:
         value: "5"
       - key: MESSAGE_TTL_MS
         value: "3600000"
+      - key: STATE_GITHUB_TOKEN
+        sync: false
+      - key: STATE_GITHUB_REPO
+        value: "aricaryxn-glitch/telegram-anonymous-room-state"
+      - key: STATE_GITHUB_PATH
+        value: "db.json"

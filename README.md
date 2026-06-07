@@ -45,6 +45,9 @@ PASSWORD_PEPPER
 ROOM_SIZE=5
 MESSAGE_TTL_MS=3600000
 PORT=3000
+STATE_GITHUB_TOKEN
+STATE_GITHUB_REPO=aricaryxn-glitch/telegram-anonymous-room-state
+STATE_GITHUB_PATH=db.json
 ```
 
 This folder includes `Procfile` and `render.yaml` for hosts such as Render.
